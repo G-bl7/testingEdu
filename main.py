@@ -1,4 +1,4 @@
-cat << EOF > main.py
+
 #!/usr/bin/env python3
 """Recursive, bandwidth-limited FTP uploader."""
 
@@ -294,4 +294,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-EOF
+
