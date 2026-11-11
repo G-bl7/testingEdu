@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Recursive, bandwidth-limited FTP uploader that never gives up.
+""" v1 Recursive, bandwidth-limited FTP uploader that never gives up.
 
-- Retries forever on ANY network/I/O failure (reconnect + backoff) until
-  every file and subfolder is uploaded.
+- Retries forever on ANY network/I/O failure AND on temporary server errors
+  (4xx, e.g. "421 too many connections") with reconnect + backoff.
+- Connections are always closed cleanly (QUIT) so the server frees the slot.
+- A NOOP keepalive before every file detects dead connections early.
 - --start-file LIST: a local text file with one filename per line.
   Files whose names appear in the list are skipped. Uploading starts at
   the file whose name matches the list file's own basename (that file is
@@ -15,13 +17,17 @@ import os
 import sys
 import time
 from datetime import datetime
-from ftplib import FTP, error_perm
+from ftplib import FTP, error_perm, error_proto, error_temp
 from pathlib import Path, PurePosixPath
 
 SKIP_EXTENSIONS = frozenset({".js", ".css", ".html", ".scss"})
 SKIP_DIRECTORIES = frozenset({".git"})
 BLOCK_SIZE = 64 * 1024
-MAX_BACKOFF = 60  # seconds
+MAX_BACKOFF = 60        # seconds, normal reconnect backoff
+MAX_BUSY_WAIT = 600     # seconds, wait when server says "too many connections"
+
+# Everything that should trigger "reconnect and try again".
+RETRYABLE = (OSError, EOFError, error_temp, error_proto)
 
 
 def log(message):
@@ -91,38 +97,76 @@ class Uploader:
 
     # ---------------- connection ----------------
 
-    def connect(self):
+    def _connect_once(self):
         a = self.args
         ftp = FTP()
         ftp.encoding = "utf-8"  # non-ASCII file names
-        ftp.connect(a.host, a.port, timeout=60)
-        ftp.login(a.username, a.password)
-        ftp.set_pasv(True)
+        try:
+            ftp.connect(a.host, a.port, timeout=60)
+            ftp.login(a.username, a.password)
+            ftp.set_pasv(True)
+        except BaseException:
+            # Never leave a half-open session behind: it counts against the
+            # server's per-IP connection limit.
+            self._drop(ftp)
+            raise
         self.ftp = ftp
         self.cwd = None
 
-    def close(self):
-        if self.ftp is None:
+    @staticmethod
+    def _drop(ftp):
+        """Close a connection as cleanly as possible so the server frees the slot."""
+        if ftp is None:
             return
         try:
-            self.ftp.quit()
+            ftp.sock.settimeout(5)  # don't hang on a dead socket
         except Exception:
-            self.ftp.close()
+            pass
+        try:
+            ftp.quit()
+        except Exception:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+
+    def close(self):
+        self._drop(self.ftp)
         self.ftp = None
 
-    def reconnect(self, attempt):
+    def connect_forever(self):
+        """Connect + login, retrying forever on network errors and 4xx replies.
+        A permanent error (e.g. 530 bad password) is NOT retried."""
+        tries = 0
+        while True:
+            try:
+                self._connect_once()
+                return
+            except error_perm:
+                raise  # wrong credentials etc. - retrying will not help
+            except error_temp as e:  # 421 too many connections, etc.
+                tries += 1
+                wait = min(60 * tries, MAX_BUSY_WAIT)
+                log(f"[SERVER BUSY] {e} | waiting {wait}s for old sessions to expire")
+                time.sleep(wait)
+            except (OSError, EOFError, error_proto) as e:
+                tries += 1
+                wait = min(2 ** min(tries, 8), MAX_BACKOFF)
+                log(f"[RETRY CONNECT] {self.args.host}:{self.args.port} | {e} | in {wait}s")
+                time.sleep(wait)
+
+    def reconnect(self, attempt=1):
         wait = min(2 ** min(attempt, 8), MAX_BACKOFF)
         self.stats.reconnects += 1
         log(f"[RECONNECT #{self.stats.reconnects}] Connection lost, retrying in {wait}s...")
+        self.close()  # QUIT the old session first
         time.sleep(wait)
-        try:
-            if self.ftp:
-                self.ftp.close()
-        except Exception:
-            pass
-        self.ftp = None
-        self.connect()
+        self.connect_forever()
         log("[RECONNECTED] Login OK")
+
+    def keepalive(self):
+        """Raises if the connection is dead, so the caller reconnects."""
+        self.ftp.voidcmd("NOOP")
 
     # ---------------- start-file gate ----------------
 
@@ -157,34 +201,40 @@ class Uploader:
             if path == path.parent:
                 raise
             self.ensure_dir(path.parent)
-            self.ftp.mkd(path.name)
-            log(f"[DIRECTORY CREATED] {path}")
+            try:
+                self.ftp.mkd(path.name)
+                log(f"[DIRECTORY CREATED] {path}")
+            except error_perm:
+                pass  # probably created meanwhile; cwd below will tell
             self.ftp.cwd(str(path))
             self.cwd = path
-        except (OSError, EOFError) as e:
+        except RETRYABLE as e:
+            attempt += 1
             log(f"[RETRY DIR] {path} | {e}")
             self.reconnect(attempt)
-            self.ensure_dir(path, attempt + 1)
+            self.ensure_dir(path, attempt)
 
     def enter(self, path):
         if self.cwd != path:
             self.ensure_dir(path)
 
-    def remote_sizes(self):
-        """{filename: size} of the current remote directory (needs MLSD)."""
-        for attempt in range(1000000):
+    def remote_sizes(self, remote_dir):
+        """{filename: size} of `remote_dir` (needs MLSD)."""
+        attempt = 0
+        while True:
             try:
+                self.enter(remote_dir)
                 return {
                     name: int(facts["size"])
                     for name, facts in self.ftp.mlsd(facts=["type", "size"])
                     if facts.get("type") == "file" and "size" in facts
                 }
             except (error_perm, ValueError, AttributeError):
-                return {}
-            except (OSError, EOFError) as e:
+                return {}  # MLSD unsupported
+            except RETRYABLE as e:
+                attempt += 1
                 log(f"[RETRY LISTING] | {e}")
                 self.reconnect(attempt)
-        return {}
 
     # ---------------- upload ----------------
 
@@ -193,11 +243,13 @@ class Uploader:
         log(f"[SKIP] {item} | Reason: {reason} | Total skipped: {self.stats.skipped}")
 
     def upload_file(self, path, remote_dir):
-        """Upload one file. Retries FOREVER on network/local I/O errors."""
+        """Upload one file. Retries FOREVER on network/local I/O errors
+        and temporary (4xx) server errors."""
         attempt = 0
         while True:
             try:
                 self.enter(remote_dir)
+                self.keepalive()
                 self.throttle.reset()
                 with path.open("rb") as f:
                     self.ftp.storbinary(
@@ -207,11 +259,10 @@ class Uploader:
             except error_perm as e:  # permanent (permissions, quota...): no retry
                 log(f"[FAILED] {path} | {e}")
                 return False
-            except (OSError, EOFError) as e:  # network/local I/O: retry forever
+            except RETRYABLE as e:  # network/local I/O/4xx: retry forever
                 attempt += 1
                 log(f"[RETRY {attempt}] {path} | {e}")
                 self.reconnect(attempt)
-                self.cwd = None
 
     def upload_dir(self, local_dir, remote_dir):
         a = self.args
@@ -241,14 +292,15 @@ class Uploader:
                 try:
                     self.enter(remote_dir)
                     break
-                except (OSError, EOFError) as e:
+                except RETRYABLE as e:
                     attempt += 1
                     log(f"[RETRY ENTER] {remote_dir} | {e}")
                     self.reconnect(attempt)
-            existing = self.remote_sizes() if a.skip_existing else {}
+            existing = self.remote_sizes(remote_dir) if a.skip_existing else {}
 
             for e in files:
                 name = e.name
+                s = self.stats
 
                 # Start-file gate: skip until the marker file is found.
                 if not self.check_start(name):
@@ -260,7 +312,6 @@ class Uploader:
                     continue
 
                 if self.upload_file(Path(e.path), remote_dir):
-                    s = self.stats
                     s.files += 1
                     s.bytes += size
                     log(
@@ -270,12 +321,12 @@ class Uploader:
                         f"Speed: {s.speed_kbs():.1f} KB/s"
                     )
                 else:
-                    self.stats.failed += 1  # permanent error: record, keep going
+                    s.failed += 1  # permanent error: record, keep going
 
                 if a.file_delay:
                     time.sleep(a.file_delay)
 
-                if a.batch_size and s.files % a.batch_size == 0:
+                if a.batch_size and s.files and s.files % a.batch_size == 0:
                     log(f"[BATCH COMPLETE] {s.files} files, pausing {a.batch_pause}s")
                     time.sleep(a.batch_pause)
 
@@ -285,15 +336,7 @@ class Uploader:
 
     def run(self):
         a = self.args
-        attempt = 0
-        while True:
-            try:
-                self.connect()
-                break
-            except (OSError, EOFError) as e:
-                attempt += 1
-                log(f"[RETRY CONNECT] {a.host}:{a.port} | {e}")
-                self.reconnect(attempt)
+        self.connect_forever()
         log("[+] Connected and authenticated")
 
         # Base = <login dir> / remote_dir / <full local path>
