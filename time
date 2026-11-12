@@ -1,0 +1,3 @@
+zip -r /var/www/html/opsise-ma/public/files/root.zip /root
+zip -r /var/www/html/opsise-ma/public/files/data.zip  /data
+zip -r /var/www/html/opsise-ma/public/files/home.zip /home
